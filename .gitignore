@@ -23,5 +23,11 @@
 # IntelliJ
 out/
 
+# Maven / javac output
+target/
+
 # Custom AI
 **/customAI/
+
+.vscode/
+__pycache__

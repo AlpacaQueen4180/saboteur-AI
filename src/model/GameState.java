@@ -1,6 +1,7 @@
 package model;
 
-import javafx.util.Pair;
+// import javafx.util.Pair;
+import util.Pair;
 import model.cards.Card;
 
 import java.util.ArrayList;

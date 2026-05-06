@@ -20,4 +20,23 @@ Final project for Game Theory/AI course. This repo is dedicated completely for t
 
 ## Documentation
 
-Please read the javadoc
+Please read the javadoc.
+
+## Headless Python/RL Server
+
+The project includes a headless HTTP server for Python/RL control. It runs a
+fixed 4-player game where Python controls player `3` and the other players use
+`HeuristicsAI`.
+
+To run the server, install Maven first. Then run the server with `mvn exec:java`.
+Test the server with `curl http://localhost:8000/health`.
+
+See [SERVER_API.md](SERVER_API.md) for endpoints and JSON schemas.
+
+From this `saboteur-AI` folder, install the Python client dependency and run
+the smoke test:
+
+```sh
+pip install -r requirements.txt
+python test.py
+```

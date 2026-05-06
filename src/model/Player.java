@@ -218,6 +218,15 @@ public abstract class Player extends GameObserver {
   }
 
   /**
+   * Returns a copy of all cards in the player's hand for external observers.
+   *
+   * @return the player's hand
+   */
+  public final ArrayList<Card> visibleHand() {
+    return hand();
+  }
+
+  /**
    * Returns a shallow copy of the player's hand
    *
    * @return the player's hand shallow copy
@@ -236,9 +245,27 @@ public abstract class Player extends GameObserver {
   }
 
   /**
+   * Returns the player's role for external observers.
+   *
+   * @return the player's role
+   */
+  public final Role visibleRole() {
+    return role();
+  }
+
+  /**
    * Returns the player's discarded cards
    *
    * @return the player's discarded cards
    */
   protected final ArrayList<Card> discarded() { return this.discarded; }
+
+  /**
+   * Returns the player's discarded cards for external observers.
+   *
+   * @return the player's discarded cards
+   */
+  public final ArrayList<Card> visibleDiscarded() {
+    return new ArrayList<>(discarded());
+  }
 }

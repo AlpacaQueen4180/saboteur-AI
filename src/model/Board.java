@@ -1,6 +1,7 @@
 package model;
 
-import javafx.util.Pair;
+// import javafx.util.Pair;
+import util.Pair;
 import model.cards.PathCard;
 
 import java.util.Arrays;
@@ -545,7 +546,7 @@ public class Board {
    * @return the goal type
    */
   final GoalType openGoal(GoalPosition goalPosition) {
-    InternalGoalType type = peekInternalGoal(goalPosition).getKey();
+    InternalGoalType type = peekInternalGoal(goalPosition).first();
     // path: 7 or _|
     if (type == InternalGoalType.ROCK1) {
       PathCard left = new PathCard(-1, PathCard.Type.LEFT_TURN_PATH);
