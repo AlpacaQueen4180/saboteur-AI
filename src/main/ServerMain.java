@@ -200,7 +200,13 @@ public class ServerMain {
           }
         }
       }
-      return actions;
+
+      return RlFeatureExtractor.enrichLegalActions(
+          actions,
+          game,
+          controlledPlayer,
+          controlledPlayer.knownGoalsView()
+      );
     }
 
     private void addPathActions(List<Map<String, Object>> actions, int handIndex, PathCard card) {
@@ -378,6 +384,12 @@ public class ServerMain {
       goals.put("MIDDLE", positionDto(board.middleGoalPosition()));
       goals.put("BOTTOM", positionDto(board.bottomGoalPosition()));
       dto.put("goals", goals);
+
+      RlFeatureExtractor.enrichBoardDto(
+        dto,
+        board,
+        controlledPlayer == null ? new LinkedHashMap<>() : controlledPlayer.knownGoalsView()
+      );
 
       List<Map<String, Object>> cells = new ArrayList<>();
       for (int y = 0; y < board.height(); y++) {
