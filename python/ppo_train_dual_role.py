@@ -68,6 +68,13 @@ def main() -> None:
     parser.add_argument("--trust-lr", type=float, default=1e-3)
     parser.add_argument("--trust-save-path", type=str, default="checkpoints/miner_trust_model.pt")
 
+    parser.add_argument(
+        "--pretrained-path",
+        type=str,
+        default="",
+        help="Optional pretrained BC checkpoint path for PPO fine-tuning.",
+    )
+
     args = parser.parse_args()
 
     check_server(args.base_url)
@@ -94,6 +101,7 @@ def main() -> None:
             rollout_steps=args.rollout_steps,
             save_every=args.save_every,
             debug_every=args.debug_every,
+            pretrained_path=args.pretrained_path,
         )
 
     elif args.miner_trust:
