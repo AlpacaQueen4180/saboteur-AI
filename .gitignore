@@ -1,5 +1,6 @@
-﻿checkpoints/
-*.pt
+﻿# checkpoints/
+# *.pt
 __pycache__/
 *.pyc
 target/
+.vscode/

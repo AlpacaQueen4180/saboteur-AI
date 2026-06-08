@@ -14,7 +14,15 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CONTROLLED_PLAYER = 3
 TARGET_ROLE = "GOLD_MINER"
 
-SAMPLE_INTERVAL_STEPS = 2
+SAMPLE_INTERVAL_STEPS = 1
+
+# Train on the full collected episode, but keep the trust model early-game
+# biased because that is when uncertainty matters most to the miner policy.
+EARLY_PROGRESS_CUTOFF = 0.25
+MID_PROGRESS_CUTOFF = 0.65
+EARLY_SAMPLE_WEIGHT = 1.00
+MID_SAMPLE_WEIGHT = 0.70
+LATE_SAMPLE_WEIGHT = 0.40
 
 # From a miner perspective, among players 0/1/2 there is usually 1 saboteur.
 PRIOR_P_SABOTEUR = 1.0 / 3.0
@@ -535,6 +543,15 @@ class TrustDataset:
     y_harmful: np.ndarray
     progress: np.ndarray
     player_event_count: np.ndarray
+    sample_weight: np.ndarray
+
+
+def sample_weight_from_progress(progress: float) -> float:
+    if progress < EARLY_PROGRESS_CUTOFF:
+        return EARLY_SAMPLE_WEIGHT
+    if progress < MID_PROGRESS_CUTOFF:
+        return MID_SAMPLE_WEIGHT
+    return LATE_SAMPLE_WEIGHT
 
 
 def add_snapshot_samples(
@@ -566,7 +583,9 @@ def add_snapshot_samples(
         role_label = 1 if role == "SABOTEUR" else 0
         harmful_label = acc.weak_harmful_label()
 
-        progress = float(global_step) / max(1.0, float(max_steps_per_game))
+        # Store the absolute step for now. collect_one_game converts this to
+        # per-episode relative progress after the final episode length is known.
+        progress = float(global_step)
         raw_player_event_count = float(acc.data["player_event_count"])
 
         xs.append(acc.to_vector())
@@ -579,7 +598,7 @@ def add_snapshot_samples(
 def collect_one_game(
     env: SaboteurHttpEnv,
     max_steps_per_game: int,
-) -> Tuple[List[np.ndarray], List[int], List[float], List[float], List[float], Dict[str, Any]]:
+) -> Tuple[List[np.ndarray], List[int], List[float], List[float], List[float], List[float], Dict[str, Any]]:
     state = env.reset_until_role(TARGET_ROLE)
 
     accumulators = {
@@ -593,6 +612,7 @@ def collect_one_game(
     y_harmfuls: List[float] = []
     progresses: List[float] = []
     player_event_counts: List[float] = []
+    sample_weights: List[float] = []
 
     global_step = 0
     global_event_count = 0
@@ -623,12 +643,11 @@ def collect_one_game(
         global_step += 1
         global_event_count += update_accumulators_from_events(accumulators, state)
 
-        if global_step % SAMPLE_INTERVAL_STEPS == 0:
-            add_snapshot_samples(
-                xs, y_roles, y_harmfuls, progresses, player_event_counts,
-                accumulators, state,
-                global_step, max_steps_per_game, global_event_count,
-            )
+        add_snapshot_samples(
+            xs, y_roles, y_harmfuls, progresses, player_event_counts,
+            accumulators, state,
+            global_step, max_steps_per_game, global_event_count,
+        )
 
         done = bool(state.get("done", False))
 
@@ -638,7 +657,14 @@ def collect_one_game(
         global_step, max_steps_per_game, global_event_count,
     )
 
-    return xs, y_roles, y_harmfuls, progresses, player_event_counts, state
+    # Convert stored absolute step positions into per-episode progress for
+    # phase metrics and sample weighting. Runtime features still use the
+    # original max_steps_per_game scale inside PlayerFeatureAccumulator.
+    final_step = max(1.0, float(global_step))
+    progresses[:] = [min(1.0, float(step) / final_step) for step in progresses]
+    sample_weights.extend(sample_weight_from_progress(p) for p in progresses)
+
+    return xs, y_roles, y_harmfuls, progresses, player_event_counts, sample_weights, state
 
 
 def collect_dataset(
@@ -653,12 +679,13 @@ def collect_dataset(
     all_y_harmful: List[float] = []
     all_progress: List[float] = []
     all_player_event_counts: List[float] = []
+    all_sample_weights: List[float] = []
 
     miner_labels = 0
     sab_labels = 0
 
     for game_idx in range(1, num_games + 1):
-        xs, y_roles, y_harmfuls, progresses, player_event_counts, final_state = collect_one_game(
+        xs, y_roles, y_harmfuls, progresses, player_event_counts, sample_weights, final_state = collect_one_game(
             env, max_steps_per_game
         )
 
@@ -667,6 +694,7 @@ def collect_dataset(
         all_y_harmful.extend(y_harmfuls)
         all_progress.extend(progresses)
         all_player_event_counts.extend(player_event_counts)
+        all_sample_weights.extend(sample_weights)
 
         miner_labels += sum(1 for y in y_roles if y == 0)
         sab_labels += sum(1 for y in y_roles if y == 1)
@@ -687,6 +715,7 @@ def collect_dataset(
         y_harmful=np.asarray(all_y_harmful, dtype=np.float32),
         progress=np.asarray(all_progress, dtype=np.float32),
         player_event_count=np.asarray(all_player_event_counts, dtype=np.float32),
+        sample_weight=np.asarray(all_sample_weights, dtype=np.float32),
     )
 
 
@@ -731,6 +760,55 @@ def trust_score_from_role_logit(role_logit: torch.Tensor) -> torch.Tensor:
     return 1.0 - 2.0 * p_sab
 
 
+def build_trust_checkpoint(
+    model: nn.Module,
+    input_dim: int,
+    epoch: int,
+    selection_metric: str,
+    selection_score: float,
+    val_metrics: Dict[str, float],
+    val_role_bce: float,
+    val_harm_bce: float,
+    val_harm_mae: float,
+) -> Dict[str, Any]:
+    return {
+        "model": {
+            k: v.detach().cpu().clone()
+            for k, v in model.state_dict().items()
+        },
+        "input_dim": input_dim,
+        "feature_names": FEATURE_NAMES,
+        "target_role": "role label 1 = SABOTEUR, role label 0 = GOLD_MINER",
+        "target_harmful": "weak behavioral threat label in [0, 1]",
+        "trust_score_definition": "trust_score = 1 - 2 * sigmoid(role_logit)",
+        "p_saboteur_definition": "p_saboteur = sigmoid(role_logit)",
+        "p_harmful_definition": "p_harmful = sigmoid(harmful_logit)",
+        "temporal": True,
+        "evidence_weighted": True,
+        "dual_head": True,
+        "sample_interval_steps": SAMPLE_INTERVAL_STEPS,
+        "progress_definition": "per-episode relative progress for training metrics and sample weights",
+        "phase_sample_weighting": True,
+        "early_progress_cutoff": EARLY_PROGRESS_CUTOFF,
+        "mid_progress_cutoff": MID_PROGRESS_CUTOFF,
+        "early_sample_weight": EARLY_SAMPLE_WEIGHT,
+        "mid_sample_weight": MID_SAMPLE_WEIGHT,
+        "late_sample_weight": LATE_SAMPLE_WEIGHT,
+        "early_prior_coef": EARLY_PRIOR_COEF,
+        "prior_p_saboteur": PRIOR_P_SABOTEUR,
+        "evidence_full_count": EVIDENCE_FULL_COUNT,
+        "role_loss_coef": ROLE_LOSS_COEF,
+        "harmful_loss_coef": HARMFUL_LOSS_COEF,
+        "saved_epoch": epoch,
+        "selection_metric": selection_metric,
+        "selection_score": selection_score,
+        "val_metrics": val_metrics,
+        "val_role_bce": val_role_bce,
+        "val_harm_bce": val_harm_bce,
+        "val_harm_mae": val_harm_mae,
+    }
+
+
 # ============================================================
 # Train / Eval
 # ============================================================
@@ -751,6 +829,7 @@ def split_dataset(dataset: TrustDataset, val_ratio: float = 0.2) -> Tuple[TrustD
             dataset.y_harmful[train_idx],
             dataset.progress[train_idx],
             dataset.player_event_count[train_idx],
+            dataset.sample_weight[train_idx],
         ),
         TrustDataset(
             dataset.x[val_idx],
@@ -758,6 +837,7 @@ def split_dataset(dataset: TrustDataset, val_ratio: float = 0.2) -> Tuple[TrustD
             dataset.y_harmful[val_idx],
             dataset.progress[val_idx],
             dataset.player_event_count[val_idx],
+            dataset.sample_weight[val_idx],
         ),
     )
 
@@ -836,6 +916,12 @@ def train_miner_trust(
     print(f"target role: controlled player must be {TARGET_ROLE}")
     print(f"num_games={num_games}, max_steps_per_game={max_steps_per_game}")
     print(f"sample_interval_steps={SAMPLE_INTERVAL_STEPS}")
+    print(
+        "phase sample weights: "
+        f"early(<{EARLY_PROGRESS_CUTOFF})={EARLY_SAMPLE_WEIGHT}, "
+        f"mid(<{MID_PROGRESS_CUTOFF})={MID_SAMPLE_WEIGHT}, "
+        f"late={LATE_SAMPLE_WEIGHT}"
+    )
     print(f"prior_p_saboteur={PRIOR_P_SABOTEUR:.3f}")
     print(f"evidence_full_count={EVIDENCE_FULL_COUNT}")
 
@@ -874,6 +960,12 @@ def train_miner_trust(
         f"min={dataset.player_event_count.min():.3f}, "
         f"max={dataset.player_event_count.max():.3f}"
     )
+    print(
+        "sample_weight: "
+        f"mean={dataset.sample_weight.mean():.3f}, "
+        f"min={dataset.sample_weight.min():.3f}, "
+        f"max={dataset.sample_weight.max():.3f}"
+    )
 
     train_set, val_set = split_dataset(dataset, val_ratio=0.2)
 
@@ -893,6 +985,7 @@ def train_miner_trust(
     y_harmful_train = torch.tensor(train_set.y_harmful, dtype=torch.float32, device=DEVICE)
     progress_train = torch.tensor(train_set.progress, dtype=torch.float32, device=DEVICE)
     event_count_train = torch.tensor(train_set.player_event_count, dtype=torch.float32, device=DEVICE)
+    sample_weight_train = torch.tensor(train_set.sample_weight, dtype=torch.float32, device=DEVICE)
 
     x_val = torch.tensor(val_set.x, dtype=torch.float32, device=DEVICE)
     y_role_val = torch.tensor(val_set.y_role, dtype=torch.float32, device=DEVICE)
@@ -909,6 +1002,12 @@ def train_miner_trust(
     print("role_loss_coef:", ROLE_LOSS_COEF)
     print("harmful_loss_coef:", HARMFUL_LOSS_COEF)
     print("early prior regularization coefficient:", EARLY_PRIOR_COEF)
+    print("checkpoint selection metric: val_acc")
+
+    best_ckpt: Dict[str, Any] = {}
+    best_epoch = 0
+    best_score = -1.0
+    best_val_metrics: Dict[str, float] = {}
 
     for epoch in range(1, epochs + 1):
         np.random.shuffle(indices)
@@ -926,6 +1025,8 @@ def train_miner_trust(
             y_role_b = y_role_train[mb_idx]
             y_harm_b = y_harmful_train[mb_idx]
             event_count_b = event_count_train[mb_idx]
+            sample_weight_b = sample_weight_train[mb_idx]
+            weight_norm = sample_weight_b.sum().clamp_min(1e-6)
 
             role_logit, harmful_logit = model(xb)
 
@@ -934,12 +1035,20 @@ def train_miner_trust(
             prior_target = torch.full_like(y_role_b, PRIOR_P_SABOTEUR)
             soft_role_target = (1.0 - evidence_weight) * prior_target + evidence_weight * y_role_b
 
-            role_loss = role_criterion(role_logit, soft_role_target).mean()
-            harmful_loss = harmful_criterion(harmful_logit, y_harm_b).mean()
+            role_loss = (
+                role_criterion(role_logit, soft_role_target) * sample_weight_b
+            ).sum() / weight_norm
+            harmful_loss = (
+                harmful_criterion(harmful_logit, y_harm_b) * sample_weight_b
+            ).sum() / weight_norm
 
             p_sab = torch.sigmoid(role_logit)
             low_evidence_weight = (1.0 - evidence_weight).clamp(0.0, 1.0)
-            prior_loss = (low_evidence_weight * (p_sab - PRIOR_P_SABOTEUR).pow(2)).mean()
+            prior_loss = (
+                low_evidence_weight
+                * (p_sab - PRIOR_P_SABOTEUR).pow(2)
+                * sample_weight_b
+            ).sum() / weight_norm
 
             loss = (
                 ROLE_LOSS_COEF * role_loss
@@ -977,6 +1086,24 @@ def train_miner_trust(
             p_harmful_val = torch.sigmoid(harmful_val_logit)
             harmful_mae = torch.mean(torch.abs(p_harmful_val - y_harmful_val)).item()
 
+        selection_score = float(val_metrics["accuracy"])
+        is_best = selection_score > best_score
+        if is_best:
+            best_score = selection_score
+            best_epoch = epoch
+            best_val_metrics = dict(val_metrics)
+            best_ckpt = build_trust_checkpoint(
+                model=model,
+                input_dim=dataset.x.shape[1],
+                epoch=epoch,
+                selection_metric="val_acc",
+                selection_score=selection_score,
+                val_metrics=best_val_metrics,
+                val_role_bce=role_val_hard_bce,
+                val_harm_bce=harmful_val_bce,
+                val_harm_mae=harmful_mae,
+            )
+
         phase_text = ""
         for phase_name in ["early", "mid", "late", "low_evidence", "enough_evidence"]:
             if phase_name in val_phase_metrics:
@@ -1006,35 +1133,28 @@ def train_miner_trust(
             f"tn={int(val_metrics['tn'])} "
             f"fp={int(val_metrics['fp'])} "
             f"fn={int(val_metrics['fn'])}"
+            f" best_epoch={best_epoch} "
+            f"best_val_acc={best_score:.3f}"
+            f"{' *best*' if is_best else ''}"
             f"{phase_text}"
         )
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "input_dim": dataset.x.shape[1],
-            "feature_names": FEATURE_NAMES,
-            "target_role": "role label 1 = SABOTEUR, role label 0 = GOLD_MINER",
-            "target_harmful": "weak behavioral threat label in [0, 1]",
-            "trust_score_definition": "trust_score = 1 - 2 * sigmoid(role_logit)",
-            "p_saboteur_definition": "p_saboteur = sigmoid(role_logit)",
-            "p_harmful_definition": "p_harmful = sigmoid(harmful_logit)",
-            "temporal": True,
-            "evidence_weighted": True,
-            "dual_head": True,
-            "sample_interval_steps": SAMPLE_INTERVAL_STEPS,
-            "early_prior_coef": EARLY_PRIOR_COEF,
-            "prior_p_saboteur": PRIOR_P_SABOTEUR,
-            "evidence_full_count": EVIDENCE_FULL_COUNT,
-            "role_loss_coef": ROLE_LOSS_COEF,
-            "harmful_loss_coef": HARMFUL_LOSS_COEF,
-        },
-        save_path,
-    )
+    if not best_ckpt:
+        raise RuntimeError("Training finished without producing a best checkpoint.")
 
-    print("saved dual-head miner trust model:", save_path)
+    model.load_state_dict(best_ckpt["model"])
+    torch.save(best_ckpt, save_path)
+
+    print(
+        "saved best dual-head miner trust model:",
+        save_path,
+        f"(epoch={best_epoch}, val_acc={best_score:.3f}, "
+        f"sab_precision={best_val_metrics.get('saboteur_precision', 0.0):.3f}, "
+        f"sab_recall={best_val_metrics.get('saboteur_recall', 0.0):.3f}, "
+        f"miner_acc={best_val_metrics.get('miner_accuracy', 0.0):.3f})"
+    )
 
     model.eval()
     with torch.no_grad():

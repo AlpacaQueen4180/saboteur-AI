@@ -74,6 +74,12 @@ def main() -> None:
         default="",
         help="Optional pretrained BC checkpoint path for PPO fine-tuning.",
     )
+    parser.add_argument(
+        "--resume-path",
+        type=str,
+        default="",
+        help="Optional miner PPO checkpoint path for pure-PPO resume training.",
+    )
 
     args = parser.parse_args()
 
@@ -89,6 +95,7 @@ def main() -> None:
             rollout_steps=args.rollout_steps,
             save_every=args.save_every,
             debug_every=args.debug_every,
+            resume_path=args.resume_path,
         )
 
     elif args.saboteur:

@@ -782,6 +782,25 @@ def compute_gae(buffer: RolloutBuffer, next_value: float = 0.0) -> Tuple[np.ndar
     return advantages, returns
 
 
+def infer_checkpoint_update(path: str) -> int:
+    stem = os.path.splitext(os.path.basename(path))[0]
+    marker = "update_"
+    idx = stem.rfind(marker)
+    if idx < 0:
+        return 0
+
+    raw = stem[idx + len(marker):]
+    digits = []
+    for ch in raw:
+        if not ch.isdigit():
+            break
+        digits.append(ch)
+
+    if not digits:
+        return 0
+    return int("".join(digits))
+
+
 # ============================================================
 # Debug
 # ============================================================
@@ -826,6 +845,7 @@ def train_miner(
     rollout_steps: int,
     save_every: int,
     debug_every: int,
+    resume_path: str = "",
 ) -> None:
     env = SaboteurHttpEnv(base_url)
 
@@ -856,8 +876,44 @@ def train_miner(
 
     episode_count = 0
     win_count = 0
+    start_update = 0
 
-    for update in range(1, total_updates + 1):
+    if resume_path:
+        if not os.path.exists(resume_path):
+            raise FileNotFoundError(f"Miner resume checkpoint not found: {resume_path}")
+
+        ckpt = torch.load(resume_path, map_location=DEVICE)
+        ckpt_obs_dim = int(ckpt.get("obs_dim", -1))
+        ckpt_action_dim = int(ckpt.get("action_dim", -1))
+        ckpt_role = ckpt.get("role", "")
+
+        if ckpt_role != "GOLD_MINER":
+            raise ValueError(f"Miner resume checkpoint has role={ckpt_role!r}, expected 'GOLD_MINER'.")
+        if ckpt_obs_dim != obs_dim or ckpt_action_dim != action_dim:
+            raise ValueError(
+                "Miner resume checkpoint dimension mismatch: "
+                f"checkpoint obs/action=({ckpt_obs_dim}, {ckpt_action_dim}), "
+                f"current obs/action=({obs_dim}, {action_dim})"
+            )
+
+        model.load_state_dict(ckpt["model"])
+
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+            print("[miner] resumed optimizer state:", resume_path)
+        else:
+            print("[miner] resume checkpoint has no optimizer state; using fresh Adam.")
+
+        start_update = int(ckpt.get("update", infer_checkpoint_update(resume_path)))
+        episode_count = int(ckpt.get("episode_count", 0))
+        win_count = int(ckpt.get("win_count", 0))
+        print(
+            f"[miner] resumed model: {resume_path} "
+            f"start_update={start_update} episodes={episode_count} wins={win_count}"
+        )
+
+    for local_update in range(1, total_updates + 1):
+        update = start_update + local_update
         buffer.clear()
         rollout_reward = 0.0
         steps_collected = 0
@@ -1005,12 +1061,22 @@ def train_miner(
             torch.save(
                 {
                     "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "source": "miner_ppo_trust_pure_ppo",
+                    "update": update,
                     "obs_dim": obs_dim,
                     "action_dim": action_dim,
                     "max_actions": MAX_ACTIONS,
                     "role": "GOLD_MINER",
                     "move_types": MOVE_TYPES,
                     "card_types": CARD_TYPES,
+                    "episode_count": episode_count,
+                    "win_count": win_count,
+                    "win_rate": win_rate,
+                    "rollout_steps": rollout_steps,
+                    "total_updates_requested": total_updates,
+                    "resume_path": resume_path,
+                    "trust_features_enabled": trust_inference.available,
                     "trust_model_path": TRUST_MODEL_PATH,
                     "trust_features": [
                         "p_saboteur",
@@ -1018,6 +1084,16 @@ def train_miner(
                         "p_harmful",
                         "player_event_count_norm",
                     ],
+                    "ppo_hyperparameters": {
+                        "gamma": GAMMA,
+                        "gae_lambda": GAE_LAMBDA,
+                        "clip_eps": CLIP_EPS,
+                        "entropy_coef": ENTROPY_COEF,
+                        "value_coef": VALUE_COEF,
+                        "lr": LR,
+                        "ppo_epochs": PPO_EPOCHS,
+                        "minibatch_size": MINIBATCH_SIZE,
+                    },
                 },
                 ckpt_path,
             )

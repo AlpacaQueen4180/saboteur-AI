@@ -1,0 +1,1 @@
+(epoch=159, val_acc=0.841, sab_precision=0.814, sab_recall=0.674, miner_acc=0.924)
